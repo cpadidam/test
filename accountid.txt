@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description:  This template deploys a VPC, with a pair of public and private subnets spread
+  across two Availability Zones. It deploys an Internet Gateway, with a default
+  route on the public subnets. It deploys a pair of NAT Gateways (one in each AZ),
+  and default routes for them in the private subnets.
+
+ 
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.1.0/24
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair
+  MyInstanceType:
+    Description: WebServer EC2 instance type in private subnet
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.nano, t2.micro, t2.small, t2.medium, t2.large]
+    ConstraintDescription: must be a valid EC2 instance type.
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 0.0.0.0/0
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  SubscriptionEndPoint:
+    Type: String
+    Description: The endpoint that receives notifications from the Amazon SNS topic.
+      The endpoint value depends on the protocol that you specify. This could be a
+      URL or ARN
+  SubscriptionProtocol:
+    Type: String
+    Description: The subscription's protocol
+    Default: email
+    
+Mappings:
+  AmazonLinuxAMI:
+    ap-northeast-1:
+      AMI: ami-0318ecd6d05daa212
+    us-east-1:
+      AMI: ami-00eb20669e0990cb4
+ 
+Metadata: 
+  setup-aws-ssm-agent:
+    files:
+      '/tmp/amazon-ssm-agent.deb':
+        source: !Sub 'https://amazon-ssm-${AWS::Region}.s3.amazonaws.com/latest/debian_amd64/amazon-ssm-agent.deb'
+        mode: '000644'
+        owner: root
+        group: root
+    commands:
+      00_setup_aws_ssm_agent:
+        command: !Sub |
+          dpkg -i /tmp/amazon-ssm-agent.deb
+          systemctl enable amazon-ssm-agent.service
+          service amazon-ssm-agent restart
+            
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+ 
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+ 
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+ 
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ1)
+
+ 
+
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+
+ 
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+ 
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+ 
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'SSH and Port 80'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+        
+  Mytest:
+    Type: AWS::SNS::Topic
+    Properties: {}
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint:
+        Ref: SubscriptionEndPoint
+      Protocol:
+        Ref: SubscriptionProtocol
+      TopicArn:
+        Ref: Mytest   
+
+ 
+
+  WebServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+        ImageId: "ami-0318ecd6d05daa212"
+        InstanceInitiatedShutdownBehavior: stop
+        InstanceType:
+            Ref: MyInstanceType
+        KeyName:
+          Ref: KeyName
+        Monitoring: 'true'
+        NetworkInterfaces:
+        - AssociatePublicIpAddress: 'true'
+          DeviceIndex: '0'
+          GroupSet:
+          - !Ref WebSecurityGroup
+          SubnetId:
+            Ref: PublicSubnet1
+        Tenancy: default
+        UserData:
+          Fn::Base64: 
+           !Sub |
+             #!/bin/bash -xe
+             sudo yum install unzip wget -y
+             curl "https://s3.amazonaws.com/aws-cli/awscli-bundle.zip" -o "awscli-bundle.zip"
+             sudo unzip awscli-bundle.zip
+             ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+             SNSNAME=MStest
+             AWS_DEFAULT_REGION=$(aws configure get region)
+             export AWS_DEFAULT_REGION
